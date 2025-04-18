@@ -2,7 +2,6 @@
 #include <shobjidl.h>        // 包含 IFileOperation 接口定义
 #include <shellscalingapi.h> // 包含 SetProcessDpiAwareness 函数
 #include <shlobj.h>          // 包含 SHCreateItemFromParsingName 函数
-#include <stdexcept>         // 包含 std::runtime_error
 #include <filesystem>
 #include <iostream>
 #include <pybind11/pybind11.h>
@@ -10,8 +9,20 @@
 #include <pybind11/functional.h>
 #include <pybind11/complex.h>
 #include <string>
+#include <wil/com.h>
+#include <fmt/core.h>
 
-#pragma comment(lib, "shell32.lib") // 链接 shell32.lib
+constexpr char *AMLEVEL = "LEVEL";
+constexpr char *AMERRORNAME = "ERRORNAME";
+constexpr char *AMTARGET = "TARGET";
+constexpr char *AMACTION = "ACTION";
+constexpr char *AMMESSAGE = "MESSAGE";
+
+constexpr char *AMCRITICAL = "CRITICAL";
+constexpr char *AMERROR = "ERROR";
+constexpr char *AMWARNING = "WARNING";
+constexpr char *AMDEBUG = "DEBUG";
+constexpr char *AMINFO = "INFO";
 
 namespace py = pybind11;
 namespace fs = std::filesystem;
@@ -26,45 +37,53 @@ enum class FileOperationType
 enum class FileOperationResult
 {
     SUCCESS = 0,
-    SourceNotExists = -2,
-    NoIFileOperationInstance = -1,
-    FailToCreateIFileOperationInstance = 1,
-    FailToSetOperationFlags = 2,
-    FailToCreateSourceIShellItem = 3,
-    FailToCreateDestinationIShellItem = 4,
-    FailToAddOperation = 5,
-    FailToPerformOperation = 6,
-    WrongOperationType = 7,
-    FailToConfig = 8,
-    UpperDirNotExists = 9,
+    PathNotExists = -2,
+    NoOperationInstance = -3,
+    FaileToCreOperationInstance = -4,
+    FailToSetOperationFlags = -5,
+    FailToCreSrcShellItem = -6,
+    FailToCreDstShellItem = -7,
+    FailToAddOperation = -8,
+    FailToPerformOperation = -9,
+    WrongOperationType = -10,
+    FailToConfig = -11,
+    UpperDirNotExists = -12,
+    DstIsNotDir = -13,
+    DstIsNotExists = -14,
+    UnknownError = -15,
+    FailToInitCOM = -16,
+    NoIFileOperationInstance = -17,
+    FailToCreateIFileOperationInstance = -18,
+    OperationAborted = -19,
+    COMInitFailed = -20,
 };
 
 struct FileOperationSet
 {
     bool NoProgressUI;
-    bool NoneUI;
     bool NoConfirmation;
     bool NoErrorUI;
     bool NoConfirmationForMakeDir;
     bool WarningIfPermanentDelete;
-    FileOperationSet()
-    {
-        NoProgressUI = false;
-        NoneUI = false;
-        NoConfirmation = false;
-        NoErrorUI = false;
-        NoConfirmationForMakeDir = true;
-        WarningIfPermanentDelete = false;
-    }
-    FileOperationSet(bool NoProgressUI, bool NoneUI, bool NoConfirmation, bool NoErrorUI, bool NoConfirmationForMakeDir, bool WarningIfPermanentDelete)
-    {
-        this->NoProgressUI = NoProgressUI;
-        this->NoneUI = NoneUI;
-        this->NoConfirmation = NoConfirmation;
-        this->NoErrorUI = NoErrorUI;
-        this->NoConfirmationForMakeDir = NoConfirmationForMakeDir;
-        this->WarningIfPermanentDelete = WarningIfPermanentDelete;
-    }
+    bool RenameOnCollision;
+    bool AllowAdminPrivilege;
+    bool AllowUndo;
+    FileOperationSet(bool NoProgressUI = false,
+                     bool NoConfirmation = false,
+                     bool NoErrorUI = false,
+                     bool NoConfirmationForMakeDir = true,
+                     bool WarningIfPermanentDelete = false,
+                     bool RenameOnCollision = false,
+                     bool AllowAdminPrivilege = true,
+                     bool AllowUndo = true)
+        : NoProgressUI(NoProgressUI),
+          NoConfirmation(NoConfirmation),
+          NoErrorUI(NoErrorUI),
+          NoConfirmationForMakeDir(NoConfirmationForMakeDir),
+          WarningIfPermanentDelete(WarningIfPermanentDelete),
+          RenameOnCollision(RenameOnCollision),
+          AllowAdminPrivilege(AllowAdminPrivilege),
+          AllowUndo(AllowUndo) {}
 };
 
 int IsDirectory(const std::wstring &path)
@@ -99,23 +118,125 @@ std::wstring Dirname(const std::wstring &path)
     return p.parent_path().wstring();
 }
 
+std::string tostr(const std::wstring &wstr)
+{
+    return std::string(wstr.begin(), wstr.end());
+}
+
+std::string lpwstr2str(LPWSTR lpwstr)
+{
+    if (lpwstr == nullptr)
+        return ""; // 处理空指针
+
+    int bufferSize = WideCharToMultiByte(
+        CP_UTF8,         // 目标编码（UTF-8）
+        0,               // 标志（默认）
+        lpwstr,          // 输入的宽字符串
+        -1,              // 自动计算输入长度
+        nullptr,         // 预计算输出缓冲区大小
+        0,               // 预计算模式
+        nullptr, nullptr // 默认字符处理
+    );
+
+    if (bufferSize == 0)
+        return ""; // 转换失败
+
+    std::string result(bufferSize, 0);
+    WideCharToMultiByte(
+        CP_UTF8, 0, lpwstr, -1,
+        &result[0], bufferSize, nullptr, nullptr);
+
+    result.pop_back(); // 移除末尾的 '\0'
+    return result;
+}
+
+using FOR = FileOperationResult;
+using TOR = std::variant<std::vector<std::pair<std::wstring, FOR>>, FOR>;
+
 class ExplorerAPI
 {
 public:
     IFileOperation *pFileOp;
-    ExplorerAPI()
+    FOR status;
+    std::atomic<bool> is_trace;
+    py::function trace_cb;
+
+    std::string GetErrorMsg(HRESULT hr)
     {
-        // 初始化 COM 库
-        HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-        if (FAILED(hr))
+        LPWSTR errorMessage = nullptr;
+        std::string msg;
+        DWORD flags = FORMAT_MESSAGE_ALLOCATE_BUFFER |
+                      FORMAT_MESSAGE_FROM_SYSTEM |
+                      FORMAT_MESSAGE_IGNORE_INSERTS;
+        DWORD dwError = HRESULT_CODE(hr);
+        FormatMessageW(
+            flags,
+            nullptr,
+            dwError,
+            MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+            (LPWSTR)&errorMessage,
+            0,
+            nullptr);
+        if (errorMessage == nullptr)
         {
-            throw std::runtime_error("COM initialization failed");
+            msg = "";
+            goto end;
+        }
+        msg = lpwstr2str(errorMessage);
+
+    end:
+        LocalFree(errorMessage);
+        if (msg.empty())
+        {
+            return "Unknown Error";
+        }
+        return msg;
+    }
+
+    void pytrace(std::string level, std::string error_name = "", std::string target = "", std::string action = "", std::string msg = "")
+    {
+        if (is_trace.load(std::memory_order_acquire))
+        {
+            std::unordered_map<std::string, std::string> level_map = {
+                {AMLEVEL, level},
+                {AMERRORNAME, error_name},
+                {AMTARGET, target},
+                {AMACTION, action},
+                {AMMESSAGE, msg},
+            };
+            {
+                py::gil_scoped_acquire acquire;
+                trace_cb(level_map);
+            }
+            // trace_cb(error_info);
+        }
+    }
+
+    void SetPyTrace(py::object pycb = py::none())
+    {
+        if (pycb.is_none())
+        {
+            is_trace = false;
+            trace_cb = py::function();
+        }
+        else
+        {
+            trace_cb = py::cast<py::function>(pycb);
+            is_trace = true;
+        }
+    }
+
+    ExplorerAPI(FileOperationSet set = FileOperationSet())
+    {
+        status = Init(set);
+        if (status != FOR::SUCCESS)
+        {
+            pFileOp = nullptr;
         }
     }
 
     ~ExplorerAPI()
     {
-        // 反初始化 COM 库
         if (pFileOp != nullptr)
         {
             pFileOp->Release();
@@ -124,17 +245,11 @@ public:
         CoUninitialize();
     }
 
-    FileOperationResult Config(FileOperationSet settings)
+    DWORD GetFlags(FileOperationSet settings)
     {
-        if (pFileOp == nullptr)
-        {
-            return FileOperationResult::NoIFileOperationInstance;
-        }
         DWORD flags = 0;
         if (settings.NoProgressUI)
             flags |= FOF_SILENT;
-        if (settings.NoneUI)
-            flags |= FOF_NO_UI;
         if (settings.NoConfirmation)
             flags |= FOF_NOCONFIRMATION;
         if (settings.NoErrorUI)
@@ -143,223 +258,234 @@ public:
             flags |= FOF_NOCONFIRMMKDIR;
         if (settings.WarningIfPermanentDelete)
             flags |= FOF_WANTNUKEWARNING;
+        if (settings.RenameOnCollision)
+            flags |= FOF_RENAMEONCOLLISION;
+        if (settings.AllowAdminPrivilege)
+            flags |= FOFX_SHOWELEVATIONPROMPT;
+        if (settings.AllowUndo)
+            flags |= FOFX_ADDUNDORECORD;
+        return flags;
+    }
+
+    FOR Config(FileOperationSet set)
+    {
+        if (pFileOp == nullptr)
+        {
+            return status;
+        }
+        DWORD flags = GetFlags(set);
         HRESULT hr = pFileOp->SetOperationFlags(flags);
         if (FAILED(hr))
         {
-            return FileOperationResult::FailToSetOperationFlags;
+            pytrace(AMCRITICAL, "ConfigFailed", "ExplorerAPI", "SetOperationFlags", GetErrorMsg(hr));
+            return FOR::FailToConfig;
         }
-        return FileOperationResult::SUCCESS;
+        return FOR::SUCCESS;
     }
 
-    FileOperationResult Init(FileOperationSet set)
+    FOR Init(FileOperationSet set, py::object pycb = py::none())
     {
-        // 设置 DPI 感知
-        SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE);
-        HRESULT hr = CoCreateInstance(
+        SetPyTrace(pycb);
+        HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+
+        if (FAILED(hr))
+        {
+            pytrace(AMCRITICAL, "InitFailed", "COMToolkit", "CoInitializeEx", GetErrorMsg(hr));
+            return FOR::FailToInitCOM;
+        }
+
+        SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE); // 设置 DPI 感知
+
+        hr = CoCreateInstance(
             CLSID_FileOperation, // CLSID_FileOperation 是 IFileOperation 的类标识符
             nullptr,
             CLSCTX_ALL,            // 在所有上下文中创建
             IID_PPV_ARGS(&pFileOp) // 获取 IFileOperation 接口
         );
+
         if (FAILED(hr))
         {
-            return FileOperationResult::FailToCreateIFileOperationInstance;
+            pytrace(AMCRITICAL, "InstanceCreateFailed", "COMInstance", "CoCreateInstance", GetErrorMsg(hr));
+            return FOR::FailToCreateIFileOperationInstance;
         }
 
-        FileOperationResult rs = Config(set);
-        switch (rs)
-        {
-        case FileOperationResult::SUCCESS:
-            return FileOperationResult::SUCCESS;
-        default:
-            pFileOp->Release();
-            pFileOp = nullptr;
-            return rs;
-        }
+        return Config(set);
     }
 
-    FileOperationResult copy(const std::wstring &src, const std::wstring &dst)
-    {
-        std::wstring dst_dir = dst;
-        std::wstring dstname = src;
-        switch (IsDirectory(src))
-        {
-        case -1:
-            return FileOperationResult::SourceNotExists;
-        case 0:
-            if (Extension(dst).empty())
-            {
-                dst_dir = dst;
-                dstname = BaseName(src);
-            }
-            else
-            {
-                dst_dir = Dirname(dst);
-                dstname = BaseName(dst);
-            }
-            break;
-        default:
-            if (BaseName(src) == BaseName(dst))
-            {
-                dst_dir = Dirname(dst);
-                dstname = BaseName(src);
-            }
-            else
-            {
-                dst_dir = dst;
-                dstname = BaseName(src);
-            }
-            break;
-        }
-        if (IsDirectory(dst_dir) == -1)
-        {
-            return FileOperationResult::UpperDirNotExists;
-        }
-        // 创建 IShellItem 实例表示源文件或文件夹
-        IShellItem
-            *pSourceItem = nullptr;
-        HRESULT hr = SHCreateItemFromParsingName(src.c_str(), nullptr, IID_PPV_ARGS(&pSourceItem));
-        if (FAILED(hr))
-        {
-            return FileOperationResult::FailToCreateSourceIShellItem;
-        }
-
-        // 创建 IShellItem 实例表示目标文件夹
-        IShellItem *pDestinationItem = nullptr;
-        std::wcout << dst_dir << std::endl;
-        hr = SHCreateItemFromParsingName(dst_dir.c_str(), nullptr, IID_PPV_ARGS(&pDestinationItem));
-        if (FAILED(hr))
-        {
-            pSourceItem->Release();
-            return FileOperationResult::FailToCreateDestinationIShellItem;
-        }
-
-        // 添加复制操作
-        hr = pFileOp->CopyItem(pSourceItem, pDestinationItem, dstname.c_str(), nullptr);
-        if (FAILED(hr))
-        {
-            pSourceItem->Release();
-            pDestinationItem->Release();
-            return FileOperationResult::FailToAddOperation;
-        }
-
-        // 执行操作
-        hr = pFileOp->PerformOperations();
-        if (FAILED(hr))
-        {
-            pSourceItem->Release();
-            pDestinationItem->Release();
-            return FileOperationResult::FailToPerformOperation;
-        }
-        pSourceItem->Release();
-        pDestinationItem->Release();
-
-        return FileOperationResult::SUCCESS;
-    }
-
-    FileOperationResult move(const std::wstring &src, const std::wstring &dst)
-    {
-        std::wstring dst_dir = dst;
-        std::wstring dstname = src;
-        switch (IsDirectory(src))
-        {
-        case -1:
-            return FileOperationResult::SourceNotExists;
-        case 0:
-            if (Extension(dst).empty())
-            {
-                dst_dir = dst;
-                dstname = BaseName(src);
-            }
-            else
-            {
-                dst_dir = Dirname(dst);
-                dstname = BaseName(dst);
-            }
-            break;
-        }
-        if (IsDirectory(dst_dir) == -1)
-        {
-            return FileOperationResult::UpperDirNotExists;
-        }
-        IShellItem *pItemMoveFrom = NULL;
-        IShellItem *pItemMoveTo = NULL;
-        HRESULT hr = SHCreateItemFromParsingName(src.c_str(), NULL, IID_PPV_ARGS(&pItemMoveFrom));
-        if (FAILED(hr))
-        {
-            return FileOperationResult::FailToCreateSourceIShellItem;
-        }
-
-        hr = SHCreateItemFromParsingName(dst_dir.c_str(), NULL, IID_PPV_ARGS(&pItemMoveTo));
-        if (FAILED(hr))
-        {
-            pItemMoveFrom->Release();
-            return FileOperationResult::FailToCreateDestinationIShellItem;
-        }
-
-        hr = pFileOp->MoveItem(pItemMoveFrom, pItemMoveTo, dstname.c_str(), nullptr);
-        if (FAILED(hr))
-        {
-            pItemMoveTo->Release();
-            pItemMoveFrom->Release();
-            return FileOperationResult::FailToAddOperation;
-        }
-
-        // Perform all operations
-        hr = pFileOp->PerformOperations();
-        if (FAILED(hr))
-        {
-            pItemMoveTo->Release();
-            pItemMoveFrom->Release();
-            return FileOperationResult::FailToPerformOperation;
-        }
-        pItemMoveTo->Release();
-        pItemMoveFrom->Release();
-
-        return FileOperationResult::SUCCESS;
-    }
-
-    FileOperationResult action(const std::wstring &src, const std::wstring &dst, FileOperationType action)
+    TOR src2dst(
+        const std::vector<std::wstring> &srcs,
+        const std::wstring &dst,
+        FileOperationType action)
     {
         if (pFileOp == nullptr)
         {
-            return FileOperationResult::FailToCreateIFileOperationInstance;
+            return status;
         }
-        switch (action)
+        std::vector<std::pair<std::wstring, FOR>> results;
+        switch (IsDirectory(dst))
         {
-        case FileOperationType::COPY:
-            return copy(src, dst);
-        case FileOperationType::MOVE:
-            return move(src, dst);
-        case FileOperationType::RM:
-            return rm(src);
+        case 1:
+            break;
+        case 0:
+            return FileOperationResult::DstIsNotDir;
+        case -1:
+            return FileOperationResult::DstIsNotExists;
         default:
-            return FileOperationResult::WrongOperationType;
+            return FileOperationResult::UnknownError;
         }
-    }
 
-    FileOperationResult rm(const std::wstring &path)
-    {
-        IShellItem *pItem = NULL;
-        HRESULT hr = SHCreateItemFromParsingName(path.c_str(), NULL, IID_PPV_ARGS(&pItem));
+        if (action != FileOperationType::COPY && action != FileOperationType::MOVE)
+        {
+            return FOR::WrongOperationType;
+        }
+
+        wil::com_ptr<IShellItem> pDstItem;
+        HRESULT hr = SHCreateItemFromParsingName(dst.c_str(), nullptr, IID_PPV_ARGS(&pDstItem));
         if (FAILED(hr))
         {
-            return FileOperationResult::FailToCreateSourceIShellItem;
+            pytrace(AMERROR, "DstShellItemCreateFailed", tostr(dst), "SHCreateItemFromParsingName", GetErrorMsg(hr));
+            return FOR::FailToCreDstShellItem;
         }
-        hr = pFileOp->DeleteItem(pItem, nullptr);
-        if (FAILED(hr))
+
+        pFileOp->SetOperationFlags(FOF_NO_UI | FOF_ALLOWUNDO);
+
+        for (const auto &src : srcs)
         {
-            pItem->Release();
-            return FileOperationResult::FailToAddOperation;
+            if (!std::filesystem::exists(src))
+            {
+                pytrace(AMWARNING, "SrcPathNotExists", tostr(src), "std::filesystem::exists", "Source path does not exist");
+                results.emplace_back(std::pair(src, FOR::PathNotExists));
+                continue;
+            }
+
+            wil::com_ptr<IShellItem> pSrcItem;
+            hr = SHCreateItemFromParsingName(src.c_str(), nullptr, IID_PPV_ARGS(&pSrcItem));
+            if (FAILED(hr))
+            {
+                pytrace(AMERROR, "SrcShellItemCreateFailed", tostr(src), "SHCreateItemFromParsingName", GetErrorMsg(hr));
+                results.emplace_back(std::pair(src, FOR::FailToCreSrcShellItem));
+                continue;
+            }
+
+            switch (action)
+            {
+            case FileOperationType::COPY:
+                hr = pFileOp->CopyItem(pSrcItem.get(), pDstItem.get(), nullptr, nullptr);
+                break;
+            case FileOperationType::MOVE:
+                hr = pFileOp->MoveItem(pSrcItem.get(), pDstItem.get(), nullptr, nullptr);
+                break;
+            default:
+                results.emplace_back(std::pair(src, FOR::WrongOperationType));
+                continue;
+            }
+            if (FAILED(hr))
+            {
+                pytrace(AMERROR, "AddOperationFailed", tostr(src), "pFileOp->CopyItem", GetErrorMsg(hr));
+                results.emplace_back(std::pair(src, FOR::FailToAddOperation));
+                continue;
+            }
+            else
+            {
+                results.emplace_back(std::pair(src, FOR::SUCCESS));
+            }
         }
+
         hr = pFileOp->PerformOperations();
         if (FAILED(hr))
         {
-            pItem->Release();
-            return FileOperationResult::FailToPerformOperation;
+            switch (action)
+            {
+            case FileOperationType::COPY:
+                pytrace(AMERROR, "CopyOperationFailed", fmt::format("[{}...]->{}", tostr(srcs[0]), tostr(dst)), "PerformOperations", GetErrorMsg(hr));
+                break;
+            case FileOperationType::MOVE:
+                pytrace(AMERROR, "MoveOperationFailed", fmt::format("[{}...]->{}", tostr(srcs[0]), tostr(dst)), "PerformOperations", GetErrorMsg(hr));
+                break;
+            }
+            return FOR::FailToPerformOperation;
         }
-        pItem->Release();
-        return FileOperationResult::SUCCESS;
+
+        BOOL aborted = FALSE;
+        pFileOp->GetAnyOperationsAborted(&aborted);
+        if (aborted)
+        {
+            pytrace(AMINFO, "", fmt::format("[{}...]->{}", tostr(srcs[0]), tostr(dst)), "PerformOperations", "Operation aborted");
+            return FOR::OperationAborted;
+        }
+
+        return results;
+    }
+
+    TOR Copy(std::vector<std::wstring> srcs, std::wstring dst)
+    {
+        return src2dst(srcs, dst, FileOperationType::COPY);
+    }
+
+    TOR Move(std::vector<std::wstring> srcs, std::wstring dst)
+    {
+        return src2dst(srcs, dst, FileOperationType::MOVE);
+    }
+
+    TOR Remove(std::vector<std::wstring> paths)
+    {
+        if (pFileOp == nullptr)
+        {
+            return status;
+        }
+
+        HRESULT hr;
+        std::vector<std::pair<std::wstring, FOR>> result = {};
+
+        for (auto path : paths)
+        {
+            if (!std::filesystem::exists(path))
+            {
+                pytrace(AMWARNING, "PathNotExists", tostr(path), "remove", "Path does not exist");
+                result.emplace_back(std::pair(path, FOR::PathNotExists));
+                continue;
+            }
+
+            wil::com_ptr<IShellItem> pItem;
+            HRESULT hr = SHCreateItemFromParsingName(path.c_str(), NULL, IID_PPV_ARGS(&pItem));
+
+            if (FAILED(hr))
+            {
+                pytrace(AMERROR, "SrcShellItemCreateFailed", tostr(path), "SHCreateItemFromParsingName", GetErrorMsg(hr));
+                result.emplace_back(std::pair(path, FOR::FailToCreSrcShellItem));
+                continue;
+            }
+
+            hr = pFileOp->DeleteItem(pItem.get(), nullptr);
+
+            if (FAILED(hr))
+            {
+                pytrace(AMERROR, "DeleteItemFailed", tostr(path), "pFileOp->DeleteItem", GetErrorMsg(hr));
+                result.emplace_back(std::pair(path, FOR::FailToAddOperation));
+                continue;
+            }
+            else
+            {
+                result.emplace_back(std::pair(path, FOR::SUCCESS));
+            }
+        }
+
+        hr = pFileOp->PerformOperations();
+
+        if (FAILED(hr))
+        {
+            pytrace(AMERROR, "PerformOperationFailed", "ExplorerAPI", "PerformOperations", GetErrorMsg(hr));
+            return FOR::FailToPerformOperation;
+        }
+
+        BOOL aborted = FALSE;
+        pFileOp->GetAnyOperationsAborted(&aborted);
+        if (aborted)
+        {
+            pytrace(AMINFO, "", fmt::format("[{}...]->null", tostr(paths[0])), "remove", "Operation aborted");
+            return FOR::OperationAborted;
+        }
+        return result;
     }
 };
 
@@ -370,33 +496,48 @@ PYBIND11_MODULE(WinFile, m)
         .value("MOVE", FileOperationType::MOVE)
         .value("REMOVE", FileOperationType::RM);
     py::class_<FileOperationSet>(m, "FileOperationSet")
-        .def(py::init<>())
-        .def(py::init<bool, bool, bool, bool, bool, bool>(), py::arg("NoProgressUI"), py::arg("NoneUI"), py::arg("NoConfirmation"), py::arg("NoErrorUI"), py::arg("NoConfirmationForMakeDir"), py::arg("WarningIfPermanentDelete"))
+        .def(py::init<bool, bool, bool, bool, bool, bool, bool, bool>(),
+             py::arg("NoProgressUI") = false,
+             py::arg("NoConfirmation") = false,
+             py::arg("NoErrorUI") = false,
+             py::arg("NoConfirmationForMakeDir") = true,
+             py::arg("WarningIfPermanentDelete") = false,
+             py::arg("RenameOnCollision") = false,
+             py::arg("AllowAdminPrivilege") = true,
+             py::arg("AllowUndo") = true)
         .def_readwrite("NoProgressUI", &FileOperationSet::NoProgressUI)
-        .def_readwrite("NoneUI", &FileOperationSet::NoneUI)
         .def_readwrite("NoConfirmation", &FileOperationSet::NoConfirmation)
         .def_readwrite("NoErrorUI", &FileOperationSet::NoErrorUI)
         .def_readwrite("NoConfirmationForMakeDir", &FileOperationSet::NoConfirmationForMakeDir)
-        .def_readwrite("WarningIfPermanentDelete", &FileOperationSet::WarningIfPermanentDelete);
+        .def_readwrite("WarningIfPermanentDelete", &FileOperationSet::WarningIfPermanentDelete)
+        .def_readwrite("RenameOnCollision", &FileOperationSet::RenameOnCollision)
+        .def_readwrite("AllowAdminPrivilege", &FileOperationSet::AllowAdminPrivilege)
+        .def_readwrite("AllowUndo", &FileOperationSet::AllowUndo);
     py::enum_<FileOperationResult>(m, "FileOperationResult")
         .value("SUCCESS", FileOperationResult::SUCCESS)
-        .value("NoIFileOperationInstance", FileOperationResult::NoIFileOperationInstance)
-        .value("FailToCreateIFileOperationInstance", FileOperationResult::FailToCreateIFileOperationInstance)
+        .value("PathNotExists", FileOperationResult::PathNotExists)
+        .value("FaileToCreOperationInstance", FileOperationResult::FaileToCreOperationInstance)
         .value("FailToSetOperationFlags", FileOperationResult::FailToSetOperationFlags)
-        .value("FailToCreateSourceIShellItem", FileOperationResult::FailToCreateSourceIShellItem)
-        .value("FailToCreateDestinationIShellItem", FileOperationResult::FailToCreateDestinationIShellItem)
+        .value("FailToCreSrcShellItem", FileOperationResult::FailToCreSrcShellItem)
+        .value("FailToCreDstShellItem", FileOperationResult::FailToCreDstShellItem)
         .value("FailToAddOperation", FileOperationResult::FailToAddOperation)
         .value("FailToPerformOperation", FileOperationResult::FailToPerformOperation)
         .value("WrongOperationType", FileOperationResult::WrongOperationType)
         .value("FailToConfig", FileOperationResult::FailToConfig)
         .value("UpperDirNotExists", FileOperationResult::UpperDirNotExists)
-        .value("SourceNotExists", FileOperationResult::SourceNotExists);
+        .value("DstIsNotDir", FileOperationResult::DstIsNotDir)
+        .value("DstIsNotExists", FileOperationResult::DstIsNotExists)
+        .value("UnknownError", FileOperationResult::UnknownError)
+        .value("FailToInitCOM", FileOperationResult::FailToInitCOM)
+        .value("NoIFileOperationInstance", FileOperationResult::NoIFileOperationInstance)
+        .value("FailToCreateIFileOperationInstance", FileOperationResult::FailToCreateIFileOperationInstance)
+        .value("OperationAborted", FileOperationResult::OperationAborted);
     py::class_<ExplorerAPI>(m, "ExplorerAPI")
-        .def(py::init<>())
+        .def(py::init<FileOperationSet>(), py::arg("set") = FileOperationSet())
+        .def("Remove", &ExplorerAPI::Remove, py::arg("path"))
+        .def("Copy", &ExplorerAPI::Copy, py::arg("src"), py::arg("dst"))
+        .def("Move", &ExplorerAPI::Move, py::arg("src"), py::arg("dst"))
         .def("Config", &ExplorerAPI::Config, py::arg("set"))
-        .def("Init", &ExplorerAPI::Init, py::arg("set"))
-        .def("action", &ExplorerAPI::action, py::arg("src"), py::arg("dst"), py::arg("action"))
-        .def("rm", &ExplorerAPI::rm, py::arg("path"))
-        .def("copy", &ExplorerAPI::copy, py::arg("src"), py::arg("dst"))
-        .def("move", &ExplorerAPI::move, py::arg("src"), py::arg("dst"));
+        .def("Init", &ExplorerAPI::Init, py::arg("set"), py::arg("pycb") = py::none())
+        .def("SetPyTrace", &ExplorerAPI::SetPyTrace, py::arg("pycb") = py::none());
 }
