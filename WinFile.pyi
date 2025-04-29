@@ -1,20 +1,48 @@
 from __future__ import annotations
 import typing
-__all__ = ['ExplorerAPI', 'FileOperationResult', 'FileOperationSet', 'FileOperationType']
+__all__ = ['AMTracer', 'ExplorerAPI', 'FileOperationResult', 'FileOperationSet', 'FileOperationType']
+class AMTracer:
+    def Clear(self) -> None:
+        ...
+    def GetAllErrors(self) -> list[dict[str, str | FileOperationResult]]:
+        ...
+    def GetCapacity(self) -> int:
+        ...
+    def GetTraceNum(self) -> int:
+        ...
+    def IsEmpty(self) -> bool:
+        ...
+    def LastTraceError(self) -> typing.Any | dict[str, str | FileOperationResult]:
+        ...
+    def SetCapacity(self, arg0: int) -> None:
+        ...
+    def SetPyTrace(self, arg0: typing.Any) -> None:
+        ...
+    def __init__(self, buffer_capacity: int = 10, trace_cb: typing.Any = None) -> None:
+        ...
+    def pause(self) -> None:
+        ...
+    def resume(self) -> None:
+        ...
+    def trace(self, arg0: str, arg1: FileOperationResult, arg2: str, arg3: str, arg4: str) -> None:
+        ...
 class ExplorerAPI:
-    def Config(self, set: FileOperationSet) -> FileOperationResult:
+    def Config(self, set: FileOperationSet) -> tuple[FileOperationResult, str]:
         ...
-    def Copy(self, src: list[str], dst: str) -> list[tuple[str, FileOperationResult]] | FileOperationResult:
+    def Copy(self, src: list[str], dst: str) -> list[tuple[str, tuple[FileOperationResult, str]]] | tuple[FileOperationResult, str]:
         ...
-    def Init(self, set: FileOperationSet, pycb: typing.Any = None) -> FileOperationResult:
+    def GetSettings(self) -> FileOperationSet:
         ...
-    def Move(self, src: list[str], dst: str) -> list[tuple[str, FileOperationResult]] | FileOperationResult:
+    def Init(self, set: FileOperationSet, pycb: typing.Any = None) -> tuple[FileOperationResult, str]:
         ...
-    def Remove(self, path: list[str]) -> list[tuple[str, FileOperationResult]] | FileOperationResult:
+    def Move(self, src: list[str], dst: str) -> list[tuple[str, tuple[FileOperationResult, str]]] | tuple[FileOperationResult, str]:
         ...
-    def SetPyTrace(self, pycb: typing.Any = None) -> None:
+    def Remove(self, path: list[str]) -> list[tuple[str, tuple[FileOperationResult, str]]] | tuple[FileOperationResult, str]:
         ...
     def __init__(self, set: FileOperationSet = ...) -> None:
+        ...
+    @property
+    def Tracer(self) -> AMTracer:
         ...
 class FileOperationResult:
     """
@@ -102,15 +130,17 @@ class FileOperationResult:
     def value(self) -> int:
         ...
 class FileOperationSet:
-    AllowAdminPrivilege: bool
+    AllowAdmin: bool
     AllowUndo: bool
-    NoConfirmation: bool
-    NoConfirmationForMakeDir: bool
+    AlwaysYes: bool
+    DeleteWarning: bool
+    Hardlink: bool
     NoErrorUI: bool
+    NoMkdirInfo: bool
     NoProgressUI: bool
     RenameOnCollision: bool
-    WarningIfPermanentDelete: bool
-    def __init__(self, NoProgressUI: bool = False, NoConfirmation: bool = False, NoErrorUI: bool = False, NoConfirmationForMakeDir: bool = True, WarningIfPermanentDelete: bool = False, RenameOnCollision: bool = False, AllowAdminPrivilege: bool = True, AllowUndo: bool = True) -> None:
+    ToRecycleBin: bool
+    def __init__(self, NoProgressUI: bool = False, NoConfirmation: bool = False, NoErrorUI: bool = False, NoMkdirInfo: bool = True, DeleteWarning: bool = False, RenameOnCollision: bool = False, AllowAdmin: bool = True, AllowUndo: bool = True, Hardlink: bool = False, ToRecycleBin: bool = False) -> None:
         ...
 class FileOperationType:
     """
