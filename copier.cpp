@@ -380,6 +380,7 @@ using ECM = std::pair<FOR, std::string>;
 using PECM = std::pair<std::string, ECM>;
 using TOR = std::pair<FileOperationStatus, std::vector<PECM>>;
 using sptr = std::shared_ptr<FileOperationSet>;
+
 struct SingleFileOperation
 {
     FileOperationType action;
@@ -400,6 +401,12 @@ private:
     FOR status;
     std::string g_error_msg = "";
     FileOperationSet settings;
+
+    bool IsFileNameValid(const std::string &name)
+    {
+        std::regex illegal_chars("[\\/:*?\"<>|]");
+        return !std::regex_search(name, illegal_chars);
+    }
 
     void trace(std::string level, FOR error_code, std::string target, std::string action, std::string message)
     {
@@ -493,6 +500,14 @@ private:
 
     TOR BaseMultiOP(std::vector<SingleFileOperation> &operations, sptr tmp_set = nullptr)
     {
+        if (!pFileOp)
+        {
+            return {FileOperationStatus::Uninitialized, {PECM("", ECM(FOR::NoIFileOperationInstance, "No IFileOperation instance"))}};
+        }
+        if (operations.empty())
+        {
+            return {FileOperationStatus::NoOperation, {PECM("", ECM(FOR::InvalidArgument, "No operations"))}};
+        }
         std::vector<PECM> results;
         bool no_task = true;
         for (auto operation : operations)
@@ -523,7 +538,7 @@ private:
         if (FAILED(hr))
         {
             this->trace(AMERROR, FOR::FailToPerformOperation, "ExplorerAPI", "PerformOperations", GetErrorMsg(hr));
-            results.emplace_back(PECM("FinalStatus", ECM(FOR::FailToPerformOperation, GetErrorMsg(hr))));
+            results.emplace_back(PECM("", ECM(FOR::FailToPerformOperation, GetErrorMsg(hr))));
             return {FileOperationStatus::FinalError, results};
         }
         return {results.empty() ? FileOperationStatus::Perfect : FileOperationStatus::PartialSuccess, results};
@@ -617,9 +632,6 @@ public:
 
     ECM PendOperation(std::string &src, std::string &dst_dir, std::string &dst_name, FileOperationType action, bool mkdir)
     {
-        std::cout << "src: " << src << std::endl;
-        std::cout << "dst_dir: " << dst_dir << std::endl;
-        std::cout << "dst_name: " << dst_name << std::endl;
         std::string srcf = realpath(src);
         std::string dstf;
         if (!std::filesystem::exists(srcf))
@@ -691,6 +703,11 @@ public:
         {
             src_wstr = WinPathFormat(srcf);
             dst_dir_wstr = WinPathFormat(dstf);
+            if (!IsFileNameValid(dst_name))
+            {
+                this->trace(AMWARNING, FOR::InvalidArgument, src, "CheckArguments", "Destination name contains invalid characters");
+                return ECM(FOR::InvalidArgument, "Destination name contains invalid characters");
+            }
             std::wstring dst_name_wstr = dst_name.empty() ? L"" : str2wstr(dst_name);
             std::wcout << "dst_name_wstr: " << dst_name_wstr << std::endl;
             wil::com_ptr<IShellItem> pSrcItem;

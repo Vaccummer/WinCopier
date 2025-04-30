@@ -5,7 +5,7 @@
                 "includePath": [
                     "${workspaceFolder}/**",
                     "D:\\CodeLib\\CPP\\AMTracer",
-                    "D:\\CodeLib\\CPP\\AMSFTP"
+                    "D:\\CodeLib\\CPP\\AMPATH"
                 ],
                 "defines": [],
                 "cStandard": "c11",

@@ -1,5 +1,7 @@
 import os
 
+print(os.path.exists(r"\\AM-LAPTOP\share_local"))
+exit()
 os.add_dll_directory(r"D:\Compiler\vcpkg\installed\x64-windows\bin")
 
 from WinFile import (
