@@ -102,6 +102,7 @@
         "span": "cpp",
         "stdfloat": "cpp",
         "any": "cpp",
-        "regex": "cpp"
+        "regex": "cpp",
+        "strstream": "cpp"
     }
 }

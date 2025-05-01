@@ -1,5 +1,6 @@
+#include "AMTools.hpp"
 #include <AMPath.hpp>
-#include <argparse/argparse.hpp>
+#include <CLI11.hpp>
 #include <filesystem>
 #include <fmt/core.h>
 #include <fmt/format.h>
@@ -110,7 +111,7 @@ struct FileOperationSet
           AllowAdmin(true),
           AllowUndo(true),
           Hardlink(false),
-          ToRecycleBin(false)
+          ToRecycleBin(true)
     {
     }
 
@@ -120,7 +121,6 @@ struct FileOperationSet
         bool AlwaysYes = false,
         bool NoErrorUI = false,
         bool NoMkdirInfo = true,
-
         bool RenameOnCollision = false,
         bool AllowAdmin = true,
         bool AllowUndo = true,
@@ -488,7 +488,7 @@ private:
 
     ECM Base1OP(FileOperationType action, std::string src, std::string dst_dir, std::string dst_name, bool mkdir, sptr tmp_set = nullptr)
     {
-        ECM ecm = PendOperation(src, dst_dir, dst_name, action, mkdir);
+        ECM ecm = PendOperation(action, src, dst_dir, dst_name, mkdir);
         if (ecm.first != FOR::SUCCESS)
         {
             return ecm;
@@ -560,15 +560,8 @@ private:
     }
 
 public:
-    ExplorerAPI(FileOperationSet set = FileOperationSet(), unsigned int buffer_capacity = 10)
+    ExplorerAPI()
     {
-        HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-        if (FAILED(hr))
-        {
-            status = FOR::FailToInitCOM;
-            return;
-        }
-        Init(set);
     }
 
     ~ExplorerAPI()
@@ -609,9 +602,16 @@ public:
 
     ECM Init(FileOperationSet set)
     {
+        HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        if (FAILED(hr))
+        {
+            g_error_msg = fmt::format("Failed to create IFileOperation instance: {}", GetErrorMsg(hr));
+            this->trace(AMCRITICAL, FOR::FailToCreateIFileOperationInstance, "COMInstance", "CoCreateInstance", g_error_msg);
+            return {FOR::FailToInitCOM, g_error_msg};
+        }
         SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE); // 设置 DPI 感知
 
-        HRESULT hr = CoCreateInstance(
+        hr = CoCreateInstance(
             CLSID_FileOperation, // CLSID_FileOperation 是 IFileOperation 的类标识符
             nullptr,
             CLSCTX_ALL,            // 在所有上下文中创建
@@ -638,12 +638,12 @@ public:
 
     ECM PendOperation(SingleFileOperation &operation)
     {
-        return PendOperation(operation.src, operation.dst_dir, operation.dst_name, operation.action, operation.mkdir);
+        return PendOperation(operation.action, operation.src, operation.dst_dir, operation.dst_name, operation.mkdir);
     }
 
-    ECM PendOperation(std::string src, std::string dst_dir, std::string dst_name, FileOperationType action, bool mkdir)
+    ECM PendOperation(FileOperationType action, std::string src, std::string dst_dir, std::string dst_name, bool mkdir)
     {
-        std::string srcf = realpath(src);
+        std::string srcf = AMPath::realpath(src, false, "\\");
         std::string dstf;
         if (!std::filesystem::exists(srcf))
         {
@@ -894,33 +894,334 @@ public:
     {
         return BaseMultiOP(operations, tmp_set);
     }
+
+    ECM Conduct(sptr tmp_set = nullptr)
+    {
+        HRESULT hr;
+        if (tmp_set)
+        {
+            FileOperationSet ori_set = settings;
+            Config(*tmp_set);
+            hr = pFileOp->PerformOperations();
+            Config(ori_set);
+        }
+        else
+        {
+            hr = pFileOp->PerformOperations();
+        }
+        if (FAILED(hr))
+        {
+            return ECM(FOR::FailToPerformOperation, GetErrorMsg(hr));
+        }
+        return ECM(FOR::SUCCESS, "");
+    }
 };
 
-int main()
+namespace CliPara
 {
-    auto res = AMPath::find("D:\\CodeLib\\**\\amsftp\\", AMPathTools::ENUMS::SearchType::File, true);
-    if (std::holds_alternative<std::vector<std::string>>(res))
+    const std::unordered_map<std::string, std::vector<char>> AvailableFuntions =
+        {{"cp", {'r', 'm', 'f', 'q'}},
+         {"cl", {'f', 'm', 'q'}},
+         {"mv", {'r', 'm', 'q'}},
+         {"rp", {'f', 'm', 'q'}},
+         {"rn", {'f', 'q'}},
+         {"rm", {'p', 'r', 'q'}},
+         {"new", {'m', 'f', 'q'}}};
+
+    std::pair<std::string, std::vector<char>> ParsingArg(int argc, char **argv)
     {
-        for (auto &path : std::get<std::vector<std::string>>(res))
+        std::string func = "";
+        std::vector<char> options{};
+        std::vector<std::string> position_args{};
+    }
+
+    struct Options
+    {
+        bool only_file;
+        bool only_dir;
+        bool force;
+        bool quiet;
+        bool regex;
+        bool mkdir;
+        bool permanent;
+        bool newname;
+        AMPathTools::ENUMS::SearchType srh;
+        FileOperationSet set;
+        std::shared_ptr<std::function<void(std::string, std::string, std::string, std::string)>> cb_ptr;
+        Options(bool only_file, bool only_dir, bool force, bool quiet, bool regex, bool mkdir, bool permanent, bool newname) : only_file(only_file), only_dir(only_dir), force(force), quiet(quiet), regex(regex), mkdir(mkdir), permanent(permanent), newname(newname)
         {
-            std::cout << path << std::endl;
+            if (quiet)
+            {
+                this->set.NoErrorUI = true;
+                this->set.NoProgressUI = true;
+                this->set.DeleteWarning = false;
+            }
+            if (permanent)
+            {
+                this->set.ToRecycleBin = false;
+            }
+            if (newname)
+            {
+                this->set.RenameOnCollision = true;
+            }
+            if (force)
+            {
+                this->set.AlwaysYes = true;
+            }
+
+            if (only_file && !only_dir)
+            {
+                this->srh = AMPathTools::ENUMS::SearchType::File;
+            }
+            else if (!only_file && only_dir)
+            {
+                this->srh = AMPathTools::ENUMS::SearchType::Directory;
+            }
+            else
+            {
+                this->srh = AMPathTools::ENUMS::SearchType::All;
+            }
+        }
+
+        void MsgRecord(std::string src, std::string error_name, std::string error_msg) {}
+    };
+
+    enum class FuntionType
+    {
+        Unknown = 0,
+        COPY = 1,
+        CLONE = 2,
+        MOVE = 3,
+        REPLACE = 4,
+        REMOVE = 5,
+        NEW = 6,
+        RENAME = 7,
+    };
+}
+
+namespace CliFunc
+{
+    void OriCallback(std::string src, std::string error, std::string msg) {}
+
+    void CopyMove(FileOperationType oper, std::vector<std::string> paths, CliPara::Options &opt, std::vector<SingleFileOperation> &tasks, std::shared_ptr<std::function<void(std::string, std::string, std::string)>> cb)
+    {
+        std::vector<std::string> srcs;
+        std::string dst;
+        if (paths.size() == 0)
+        {
+            return;
+        }
+        else if (paths.size() == 1)
+        {
+            srcs = paths;
+            dst = std::filesystem::current_path().string();
+        }
+        else
+        {
+            dst = paths.back();
+            srcs = paths;
+            srcs.pop_back();
+        }
+        amprint("srcs len", srcs.size());
+
+        for (auto src : srcs)
+        {
+            for (auto path : AMPath::find(src, opt.srh, opt.regex, opt.quiet, cb))
+            {
+                amprint("path_matched: ", path);
+                tasks.emplace_back(SingleFileOperation(oper, src, dst, "", opt.mkdir));
+            }
         }
     }
-    else if (std::holds_alternative<std::pair<std::string, std::string>>(res))
+
+    void Remove(FileOperationType oper, std::vector<std::string> &paths, CliPara::Options &opt, std::vector<SingleFileOperation> &tasks, std::shared_ptr<std::function<void(std::string, std::string, std::string)>> cb)
     {
-        auto [path, error] = std::get<std::pair<std::string, std::string>>(res);
-        std::cout << path << ": " << error << std::endl;
+        for (auto src : paths)
+        {
+            for (auto path : AMPath::find(src, opt.srh, opt.regex, opt.quiet, cb))
+            {
+                tasks.emplace_back(SingleFileOperation(FileOperationType::REMOVE, src, "", "", opt.mkdir));
+            }
+        }
     }
-    // auto res = AMPath::split("\\\\wsl.localhost\\Ubuntu-22.04\\mnt\\m");
-    // std::cout << "res.size(): " << res.size() << std::endl;
-    // for (auto &path : res)
-    // {
-    //     std::cout << path << std::endl;
-    // }
-    // std::cout << AMPath::join("C:/", "Users\\", "/Adm\\/i\\n\\yes/ok", "\\/a\\//") << std::endl;
-    // for (auto &entry : fs::directory_iterator("D:"))
-    // {
-    //     std::cout << entry.path().string() << std::endl;
-    // }
-    return 0;
+
+    void New(std::vector<std::string> paths, CliPara::Options opt) {}
+}
+
+int main(int argc, char **argv)
+{
+    using task = SingleFileOperation;
+    using op = FileOperationType;
+    using EC = FileOperationResult;
+    using CB = std::function<void(std::string, std::string, std::string)>;
+    amprint(1);
+    CLI::App app{"AMIO"};
+
+    bool use_regex = false;
+    bool mkdir = false;
+    bool conflict_newname = false;
+    bool force_overlap = false;
+    bool quiet = false;
+    bool permanent_delete = false;
+    bool only_file = false;
+    bool only_dir = false;
+    amprint(2);
+    std::vector<std::string> cp_paths;
+    CLI::App *copy_cmd = app.add_subcommand("cp", "Copy path to a certain directory");
+    copy_cmd->add_option("Srcs&Dst", cp_paths, "If only one path, copy to cwd or the last one serves as dst dir")
+        ->required();
+    copy_cmd->add_flag("-m,--mkdir", mkdir, "Make dir when dst dir not exists");
+    copy_cmd->add_flag("-f,--file", only_file, "Only Match Files when search path(Won't exclude exact directory path in input)");
+    copy_cmd->add_flag("-d,--dir", only_file, "Only Match Directories when search path(Won't exclude exact directory path in input)");
+    copy_cmd->add_flag("-o,--overlap", force_overlap, "Overlap path when dst path already exists");
+    copy_cmd->add_flag("-n,--new", conflict_newname, "Create new name when dst path already exists ");
+    copy_cmd->add_flag("-r,--regex", use_regex, "User regex to find paths, use <> to wrap your pattern");
+    copy_cmd->add_flag("-q,--quiet", quiet, "No UI, auto cre new name when conflict");
+
+    amprint(3);
+    std::vector<std::string> cl_paths;
+    CLI::App *clone_cmd = app.add_subcommand("cl", "Clone src to dst");
+    clone_cmd->add_option("Src&Dst", cl_paths, "Target Path and Destination")
+        ->required()
+        ->expected(2);
+    clone_cmd->add_flag("-m,--mkdir", mkdir, "Make dir when dst dir not exists");
+    clone_cmd->add_flag("-o,--overlap", force_overlap, "Overlap path when dst path already exists");
+    clone_cmd->add_flag("-n,--new", conflict_newname, "Create new name when dst path already exists");
+    clone_cmd->add_flag("-q,--quiet", quiet, "No UI, auto cre new name when conflict");
+
+    amprint(4);
+    std::vector<std::string> mv_paths;
+    CLI::App *move_cmd = app.add_subcommand("mv", "Move path to a certain directory");
+    move_cmd->add_option("Srcs&Dst", mv_paths, "If only one path, move to cwd or the last one serves as dst dir")
+        ->required();
+    move_cmd->add_flag("-m,--mkdir", mkdir, "Make dir when dst dir not exists");
+    move_cmd->add_flag("-f,--file", only_file, "Only Match Files when search path(Won't exclude exact directory path in input)");
+    move_cmd->add_flag("-d,--dir", only_file, "Only Match Directories when search path(Won't exclude exact directory path in input)");
+    move_cmd->add_flag("-o,--overlap", force_overlap, "Overlap path when dst path already exists");
+    move_cmd->add_flag("-n,--new", conflict_newname, "Create new name when dst path already exists ");
+    move_cmd->add_flag("-r,--regex", use_regex, "User regex to find paths, use <> to wrap your pattern");
+    move_cmd->add_flag("-q,--quiet", quiet, "No UI, auto cre new name when conflict");
+
+    std::vector<std::string> mr_paths;
+    CLI::App *replace_cmd = app.add_subcommand("mr", "Move and Replace");
+    replace_cmd->add_option("Src&Dst", mr_paths, "Move the fist path to second's upper dir and replace it")
+        ->required()
+        ->expected(2);
+    replace_cmd->add_flag("-m, --mkdir", mkdir, "Make dir when dst dir not exists");
+    replace_cmd->add_flag("-o,--overlap", force_overlap, "Overlap path when dst path already exists");
+    replace_cmd->add_flag("-n,--new", conflict_newname, "Create new name when dst path already exists");
+    replace_cmd->add_flag("-q,--quiet", quiet, "No UI, auto cre new name when conflict");
+
+    std::vector<std::string> rm_paths;
+    CLI::App *remove_cmd = app.add_subcommand("rm", "Remove paths");
+    remove_cmd->add_option("Paths", rm_paths, "The paths to be removed")
+        ->required();
+    remove_cmd->add_flag("-r,--regex", use_regex, "Use regex to find paths, use <> to wrap your pattern");
+    remove_cmd->add_flag("-q,--quite", quiet, "Use regex to find paths, use <> to wrap your pattern");
+    remove_cmd->add_flag("-p,--permanent", use_regex, "Directly delete path rather than move to Recycle Bin (But UNDO is still available)");
+
+    std::vector<std::string> rn_paths;
+    CLI::App *rename_cmd = app.add_subcommand("rn", "Rename path to a new name");
+    rename_cmd->add_option("src&newname", rn_paths, "Move the fist path to second's upper dir and replace it")
+        ->required()
+        ->expected(2);
+    rename_cmd->add_flag("-o,--overlap", force_overlap, "Overlap path when dst path already exists");
+
+    std::vector<std::string> new_paths;
+    CLI::App *new_cmd = app.add_subcommand("new", "Create a new file");
+    new_cmd->add_option("dsts", new_paths, "The paths to be removed")
+        ->required();
+    new_cmd->add_flag("-m,--mkdir", mkdir, "Make dir when dst dir not exists");
+
+    try
+    {
+        CLI11_PARSE(app, argc, argv);
+    }
+    catch (const CLI::ParseError &e)
+    {
+        return app.exit(e);
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "Arg Parse Error: " << e.what() << std::endl;
+        exit(-1);
+    }
+
+    CliPara::Options opt{only_file, only_dir, force_overlap, quiet, use_regex, mkdir, permanent_delete, conflict_newname};
+    std::shared_ptr<CB> call_ptr = nullptr;
+    if (!opt.quiet)
+    {
+        call_ptr = std::make_shared<CB>(CliFunc::OriCallback);
+    }
+
+    std::vector<task> TASKS;
+    if (copy_cmd->parsed())
+    {
+        CliFunc::CopyMove(op::COPY, cp_paths, opt, TASKS, call_ptr);
+    }
+    else if (clone_cmd->parsed())
+    {
+        TASKS.emplace_back(task(op::COPY, mr_paths[0], AMPath::dirname(mr_paths[1]), AMPath::basename(mr_paths[1]), opt.mkdir));
+    }
+    else if (move_cmd->parsed())
+    {
+        CliFunc::CopyMove(op::MOVE, mv_paths, opt, TASKS, call_ptr);
+    }
+    else if (replace_cmd->parsed())
+    {
+        TASKS.emplace_back(task(op::MOVE, mr_paths[0], AMPath::dirname(mr_paths[1]), AMPath::basename(mr_paths[1]), opt.mkdir));
+    }
+    else if (remove_cmd->parsed())
+    {
+        CliFunc::Remove(op::REMOVE, rm_paths, opt, TASKS, call_ptr);
+    }
+    else if (rename_cmd->parsed())
+    {
+        TASKS.emplace_back(task(op::RENAME, mr_paths[0], "", mr_paths[1], opt.mkdir));
+    }
+    else if (new_cmd->parsed())
+    {
+        CliFunc::New(new_paths, opt);
+    }
+    else
+    {
+        std::cerr << "ParsingError: No valid Funtion name provided!" << std::endl;
+        exit(-1);
+    }
+
+    if (TASKS.empty())
+    {
+        std::cerr << "TaskLoadError: No tasks get!" << std::endl;
+        exit(-2);
+    }
+    auto exp = ExplorerAPI();
+    ECM ecm = exp.Init(opt.set);
+    if (ecm.first != EC::SUCCESS)
+    {
+        std::cerr << GetECName(ecm.first) << ": " << ecm.second;
+        exit(static_cast<int>(ecm.first));
+    }
+    bool has_task = false;
+    for (auto task_i : TASKS)
+    {
+        ecm = exp.PendOperation(task_i);
+        if (ecm.first != EC::SUCCESS)
+        {
+            std::cerr << GetECName(ecm.first) << ": " << ecm.second << std::endl;
+        }
+        else
+        {
+            has_task = true;
+        }
+    }
+    if (!has_task)
+    {
+        std::cerr << "TaskLoadError: All tasks load failed!" << std::endl;
+        exit(-2);
+    }
+    ecm = exp.Conduct();
+    if (ecm.first != EC::SUCCESS)
+    {
+        std::cerr << GetECName(ecm.first) << ": " << ecm.second;
+    }
 }
