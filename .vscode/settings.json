@@ -1,5 +1,8 @@
 {
     "files.associations": {
+        "*.sqlbook": "sql",
+        "*.ndjson": "jsonl",
+        "*.dbclient-js": "javascript",
         "iostream": "cpp",
         "array": "cpp",
         "atomic": "cpp",
@@ -89,6 +92,17 @@
         "xtree": "cpp",
         "xutility": "cpp",
         "coroutine": "cpp",
-        "queue": "cpp"
+        "queue": "cpp",
+        "bitset": "cpp",
+        "cfenv": "cpp",
+        "csetjmp": "cpp",
+        "ranges": "cpp",
+        "shared_mutex": "cpp",
+        "source_location": "cpp",
+        "span": "cpp",
+        "stdfloat": "cpp",
+        "any": "cpp",
+        "regex": "cpp",
+        "strstream": "cpp"
     }
 }

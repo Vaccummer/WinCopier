@@ -4,14 +4,12 @@
                 "name": "Win32",
                 "includePath": [
                     "${workspaceFolder}/**",
-                    "E:\\vcpkg\\installed\\x64-windows\\include",
-                    "C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.22000.0\\winrt",
-                    "E:\\Softwares\\Anaconda\\envs\\Launcher\\lib\\site-packages\\pybind11\\include",
-                    "E:\\Softwares\\Anaconda\\envs\\Launcher\\include"
+                    "D:\\CodeLib\\CPP\\AMTracer",
+                    "D:\\CodeLib\\CPP\\AMPATH"
                 ],
                 "defines": [],
                 "cStandard": "c11",
-                "cppStandard": "c++17",
+                "cppStandard": "c++17"
             }
         ],
         "version": 4
